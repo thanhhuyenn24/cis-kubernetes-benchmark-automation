@@ -1,0 +1,200 @@
+---
+# =============================================================================
+# Description : CIS Kubernetes Benchmark v1.12.0 - Section 1.1 Remediation
+# Scope       : Control Plane Node Configuration Files (1.1.1 - 1.1.21)
+# Usage       : ansible-playbook remediate_1.1.yml -i inventory.ini
+# Requirements: Run with root privileges (become: yes)
+# =============================================================================
+
+- name: "CIS K8s Benchmark v1.12.0 - Section 1.1 Remediation"
+  hosts: masters
+  become: yes
+  gather_facts: no
+
+  vars:
+    manifest_dir: "/etc/kubernetes/manifests"
+    kubeconfig_files:
+      - "/etc/kubernetes/admin.conf"
+      - "/etc/kubernetes/super-admin.conf"
+      - "/etc/kubernetes/scheduler.conf"
+      - "/etc/kubernetes/controller-manager.conf"
+    pki_dir: "/etc/kubernetes/pki"
+    etcd_dir: "/var/lib/etcd"
+    cni_conf_dir: "/etc/cni/net.d"
+
+  tasks:
+
+    # -----------------------------------------------------------------------
+    # 1.1.1 – 1.1.8  Core manifest files
+    # -----------------------------------------------------------------------
+    - name: "1.1.1/1.1.3/1.1.5/1.1.7 - Set manifest file permissions to 600"
+      tags: ["1.1", "1.1.1", "1.1.3", "1.1.5", "1.1.7"]
+      find:
+        paths: "{{ manifest_dir }}"
+        patterns: "*.yaml"
+        file_type: file
+        recurse: no
+      register: manifest_files
+
+    - name: "1.1.1/1.1.3/1.1.5/1.1.7 - Apply chmod 600 to manifest files"
+      tags: ["1.1", "1.1.1", "1.1.3", "1.1.5", "1.1.7"]
+      file:
+        path: "{{ item.path }}"
+        mode: "0600"
+        owner: root
+        group: root
+      loop: "{{ manifest_files.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    # -----------------------------------------------------------------------
+    # 1.1.9 – 1.1.10  CNI configuration files
+    # NOTE: /opt/cni/bin contains executables – must NOT be chmod 600
+    # Only /etc/cni/net.d/ (config files) is targeted
+    # -----------------------------------------------------------------------
+    - name: "1.1.9/1.1.10 - Check CNI config directory exists"
+      tags: ["1.1", "1.1.9", "1.1.10"]
+      stat:
+        path: "{{ cni_conf_dir }}"
+      register: cni_dir_stat
+
+    - name: "1.1.9/1.1.10 - Find CNI config files"
+      tags: ["1.1", "1.1.9", "1.1.10"]
+      find:
+        paths: "{{ cni_conf_dir }}"
+        file_type: file
+        recurse: yes
+      register: cni_files
+      when: cni_dir_stat.stat.exists
+
+    - name: "1.1.9/1.1.10 - Set CNI config file permissions and ownership"
+      tags: ["1.1", "1.1.9", "1.1.10"]
+      file:
+        path: "{{ item.path }}"
+        mode: "0600"
+        owner: root
+        group: root
+      loop: "{{ cni_files.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+      when: cni_dir_stat.stat.exists and cni_files.files | length > 0
+
+    # -----------------------------------------------------------------------
+    # 1.1.11 – 1.1.12  etcd data directory
+    # -----------------------------------------------------------------------
+    - name: "1.1.11 - Check etcd data directory exists"
+      tags: ["1.1", "1.1.11", "1.1.12"]
+      stat:
+        path: "{{ etcd_dir }}"
+      register: etcd_dir_stat
+
+    - name: "1.1.11 - Set etcd data directory permissions to 700"
+      tags: ["1.1", "1.1.11"]
+      file:
+        path: "{{ etcd_dir }}"
+        mode: "0700"
+      when: etcd_dir_stat.stat.exists
+
+    - name: "1.1.12 - Check if OS user etcd exists"
+      tags: ["1.1", "1.1.12"]
+      command: id etcd
+      register: etcd_user_check
+      failed_when: false
+      changed_when: false
+      when: etcd_dir_stat.stat.exists
+
+    - name: "1.1.12 - Set etcd data directory ownership to etcd:etcd"
+      tags: ["1.1", "1.1.12"]
+      file:
+        path: "{{ etcd_dir }}"
+        owner: etcd
+        group: etcd
+      when:
+        - etcd_dir_stat.stat.exists
+        - etcd_user_check is not skipped
+        - etcd_user_check.rc | default(1) == 0
+
+    - name: "1.1.12 - Warn if OS user etcd not found"
+      tags: ["1.1", "1.1.12"]
+      debug:
+        msg: "WARNING: OS user 'etcd' not found. etcd may run inside a container. Verify ownership manually."
+      when:
+        - etcd_dir_stat.stat.exists
+        - etcd_user_check is skipped or etcd_user_check.rc | default(1) != 0
+
+    # -----------------------------------------------------------------------
+    # 1.1.13 – 1.1.18  Kubeconfig files
+    # -----------------------------------------------------------------------
+    - name: "1.1.13-1.1.18 - Check kubeconfig files exist"
+      tags: ["1.1", "1.1.13", "1.1.14", "1.1.15", "1.1.16", "1.1.17", "1.1.18"]
+      stat:
+        path: "{{ item }}"
+      loop: "{{ kubeconfig_files }}"
+      register: kubeconfig_stat
+
+    - name: "1.1.13-1.1.18 - Set kubeconfig file permissions and ownership"
+      tags: ["1.1", "1.1.13", "1.1.14", "1.1.15", "1.1.16", "1.1.17", "1.1.18"]
+      file:
+        path: "{{ item.item }}"
+        mode: "0600"
+        owner: root
+        group: root
+      loop: "{{ kubeconfig_stat.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: item.stat.exists
+
+    # -----------------------------------------------------------------------
+    # 1.1.19  PKI directory ownership
+    # -----------------------------------------------------------------------
+    - name: "1.1.19 - Set PKI directory and all files ownership to root:root"
+      tags: ["1.1", "1.1.19"]
+      file:
+        path: "{{ pki_dir }}"
+        owner: root
+        group: root
+        recurse: yes
+
+    # -----------------------------------------------------------------------
+    # 1.1.20  PKI certificate files: 644
+    # -----------------------------------------------------------------------
+    - name: "1.1.20 - Find PKI certificate files (*.crt, *.pub)"
+      tags: ["1.1", "1.1.20"]
+      find:
+        paths: "{{ pki_dir }}"
+        patterns:
+          - "*.crt"
+          - "*.pub"
+        file_type: file
+        recurse: yes
+      register: pki_cert_files
+
+    - name: "1.1.20 - Set PKI certificate file permissions to 644"
+      tags: ["1.1", "1.1.20"]
+      file:
+        path: "{{ item.path }}"
+        mode: "0644"
+      loop: "{{ pki_cert_files.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    # -----------------------------------------------------------------------
+    # 1.1.21  PKI key files: 600
+    # -----------------------------------------------------------------------
+    - name: "1.1.21 - Find PKI key files (*.key)"
+      tags: ["1.1", "1.1.21"]
+      find:
+        paths: "{{ pki_dir }}"
+        patterns: "*.key"
+        file_type: file
+        recurse: yes
+      register: pki_key_files
+
+    - name: "1.1.21 - Set PKI key file permissions to 600"
+      tags: ["1.1", "1.1.21"]
+      file:
+        path: "{{ item.path }}"
+        mode: "0600"
+      loop: "{{ pki_key_files.files }}"
+      loop_control:
+        label: "{{ item.path }}"

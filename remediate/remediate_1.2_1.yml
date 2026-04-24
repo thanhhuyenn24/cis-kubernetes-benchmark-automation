@@ -1,0 +1,287 @@
+---
+# =============================================================================
+# Description : CIS Kubernetes Benchmark v1.12.0 - Section 1.2 Part 1 Remediation
+# Scope       : API Server Arguments (1.2.1 - 1.2.12)
+# Usage       : ansible-playbook remediate_1.2_1.yml -i inventory.ini
+#               ansible-playbook remediate_1.2_1.yml -i inventory.ini --tags "1.2.6"
+#               ansible-playbook remediate_1.2_1.yml -i inventory.ini --check --diff
+# Requirements: Run with root privileges (become: yes)
+# =============================================================================
+
+- name: "CIS K8s Benchmark v1.12.0 - Section 1.2 Part 1 Remediation"
+  hosts: masters
+  become: yes
+  gather_facts: no
+
+  vars:
+    manifest_file: "/etc/kubernetes/manifests/kube-apiserver.yaml"
+    rate_limit_file: "/etc/kubernetes/pki/event-rate-limit.yaml"
+    pki_dir: "/etc/kubernetes/pki"
+
+  handlers:
+    - name: restart kubelet
+      systemd:
+        name: kubelet
+        state: restarted
+
+    - name: wait for apiserver ready
+      command: >
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf wait
+        --for=condition=Ready pod
+        -n kube-system
+        -l component=kube-apiserver
+        --timeout=5s
+      register: wait_result
+      retries: 18
+      delay: 5
+      until: wait_result.rc == 0
+      changed_when: false
+      listen: restart kubelet
+
+  tasks:
+
+    # -----------------------------------------------------------------------
+    # Pre-flight: backup manifest
+    # -----------------------------------------------------------------------
+    - name: "Pre-flight - Backup API server manifest"
+      tags: always
+      copy:
+        src: "{{ manifest_file }}"
+        dest: "{{ manifest_file }}.bak.{{ ansible_date_time.iso8601_basic_short | default(lookup('pipe', 'date +%Y%m%d_%H%M%S')) }}"
+        remote_src: yes
+      when: manifest_file is file
+
+    - name: "Pre-flight - Check manifest exists"
+      tags: always
+      stat:
+        path: "{{ manifest_file }}"
+      register: manifest_stat
+      failed_when: not manifest_stat.stat.exists
+
+    # -----------------------------------------------------------------------
+    # 1.2.1  --anonymous-auth  *** EXCEPTION - Manual / Not Scored ***
+    #
+    # k8s v1.29 readiness probe calls /readyz anonymously via HTTP.
+    # Setting --anonymous-auth=false causes 401, pod stays 0/1 Running.
+    # Cluster uses RBAC (Node,RBAC) as compensating control.
+    # Risk accepted per CIS Benchmark v1.12.0 page 62 (Not Scored).
+    # -----------------------------------------------------------------------
+    - name: "1.2.1 - anonymous-auth: SKIPPED (Manual/Not Scored - exception documented)"
+      tags: ["1.2", "1.2.1"]
+      debug:
+        msg: >
+          EXCEPTION: 1.2.1 anonymous-auth is Manual/Not Scored.
+          Readiness probe requires anonymous access to /readyz.
+          Compensating control: --authorization-mode=Node,RBAC is enforced.
+          See report section 3.4.4 for full justification.
+
+    # -----------------------------------------------------------------------
+    # 1.2.2  Remove --token-auth-file
+    # -----------------------------------------------------------------------
+    - name: "1.2.2 - Remove --token-auth-file if present"
+      tags: ["1.2", "1.2.2"]
+      lineinfile:
+        path: "{{ manifest_file }}"
+        regexp: '^\s+- --token-auth-file.*$'
+        state: absent
+      notify: restart kubelet
+
+    # -----------------------------------------------------------------------
+    # 1.2.3  DenyServiceExternalIPs in --enable-admission-plugins
+    # -----------------------------------------------------------------------
+    - name: "1.2.3 - Ensure DenyServiceExternalIPs in admission plugins"
+      tags: ["1.2", "1.2.3"]
+      shell: |
+        if grep -q '\-\-enable-admission-plugins' {{ manifest_file }}; then
+          current=$(grep -oP '(?<=--enable-admission-plugins=)\S+' {{ manifest_file }})
+          if echo "$current" | grep -q "DenyServiceExternalIPs"; then
+            echo "already present"
+          else
+            sed -i "s|--enable-admission-plugins=\(.*\)|--enable-admission-plugins=\1,DenyServiceExternalIPs|" {{ manifest_file }}
+            echo "added"
+          fi
+        else
+          sed -i "/- kube-apiserver/a \    - --enable-admission-plugins=NodeRestriction,DenyServiceExternalIPs" {{ manifest_file }}
+          echo "inserted"
+        fi
+      register: deny_result
+      changed_when: "'added' in deny_result.stdout or 'inserted' in deny_result.stdout"
+      notify: restart kubelet
+
+    # -----------------------------------------------------------------------
+    # 1.2.4  --kubelet-client-certificate and --kubelet-client-key
+    # -----------------------------------------------------------------------
+    - name: "1.2.4 - Ensure --kubelet-client-certificate is set"
+      tags: ["1.2", "1.2.4"]
+      lineinfile:
+        path: "{{ manifest_file }}"
+        regexp: '^\s+- --kubelet-client-certificate.*$'
+        line: "    - --kubelet-client-certificate={{ pki_dir }}/apiserver-kubelet-client.crt"
+        insertafter: '- kube-apiserver'
+      notify: restart kubelet
+
+    - name: "1.2.4 - Ensure --kubelet-client-key is set"
+      tags: ["1.2", "1.2.4"]
+      lineinfile:
+        path: "{{ manifest_file }}"
+        regexp: '^\s+- --kubelet-client-key.*$'
+        line: "    - --kubelet-client-key={{ pki_dir }}/apiserver-kubelet-client.key"
+        insertafter: '- kube-apiserver'
+      notify: restart kubelet
+
+    # -----------------------------------------------------------------------
+    # 1.2.5  --kubelet-certificate-authority
+    # -----------------------------------------------------------------------
+    - name: "1.2.5 - Ensure --kubelet-certificate-authority is set"
+      tags: ["1.2", "1.2.5"]
+      lineinfile:
+        path: "{{ manifest_file }}"
+        regexp: '^\s+- --kubelet-certificate-authority.*$'
+        line: "    - --kubelet-certificate-authority={{ pki_dir }}/ca.crt"
+        insertafter: '- kube-apiserver'
+      notify: restart kubelet
+
+    # -----------------------------------------------------------------------
+    # 1.2.6 / 1.2.7 / 1.2.8  --authorization-mode=Node,RBAC
+    # -----------------------------------------------------------------------
+    - name: "1.2.6/1.2.7/1.2.8 - Set --authorization-mode=Node,RBAC"
+      tags: ["1.2", "1.2.6", "1.2.7", "1.2.8"]
+      lineinfile:
+        path: "{{ manifest_file }}"
+        regexp: '^\s+- --authorization-mode.*$'
+        line: "    - --authorization-mode=Node,RBAC"
+        insertafter: '- kube-apiserver'
+      notify: restart kubelet
+
+    # -----------------------------------------------------------------------
+    # 1.2.9  EventRateLimit admission controller
+    # -----------------------------------------------------------------------
+    - name: "1.2.9 - Deploy EventRateLimit AdmissionConfiguration file"
+      tags: ["1.2", "1.2.9"]
+      copy:
+        dest: "{{ rate_limit_file }}"
+        mode: "0644"
+        content: |
+          apiVersion: apiserver.config.k8s.io/v1
+          kind: AdmissionConfiguration
+          plugins:
+          - name: EventRateLimit
+            configuration:
+              apiVersion: eventratelimit.admission.k8s.io/v1alpha1
+              kind: Configuration
+              limits:
+              - type: Server
+                qps: 5000
+                burst: 20000
+
+    - name: "1.2.9 - Ensure --admission-control-config-file is set"
+      tags: ["1.2", "1.2.9"]
+      lineinfile:
+        path: "{{ manifest_file }}"
+        regexp: '^\s+- --admission-control-config-file.*$'
+        line: "    - --admission-control-config-file={{ rate_limit_file }}"
+        insertafter: '- kube-apiserver'
+      notify: restart kubelet
+
+    - name: "1.2.9 - Add EventRateLimit to admission plugins"
+      tags: ["1.2", "1.2.9"]
+      shell: |
+        if grep -q '\-\-enable-admission-plugins' {{ manifest_file }}; then
+          current=$(grep -oP '(?<=--enable-admission-plugins=)\S+' {{ manifest_file }})
+          if echo "$current" | grep -q "EventRateLimit"; then
+            echo "already present"
+          else
+            sed -i "s|--enable-admission-plugins=\(.*\)|--enable-admission-plugins=\1,EventRateLimit|" {{ manifest_file }}
+            echo "added"
+          fi
+        else
+          echo "flag not found"
+        fi
+      register: erl_result
+      changed_when: "'added' in erl_result.stdout"
+      notify: restart kubelet
+
+    # -----------------------------------------------------------------------
+    # 1.2.10  Remove AlwaysAdmit from admission plugins
+    # -----------------------------------------------------------------------
+    - name: "1.2.10 - Remove AlwaysAdmit from --enable-admission-plugins"
+      tags: ["1.2", "1.2.10"]
+      shell: |
+        if grep -q "AlwaysAdmit" {{ manifest_file }}; then
+          sed -i 's/,AlwaysAdmit//g; s/AlwaysAdmit,//g; s/AlwaysAdmit//g' {{ manifest_file }}
+          echo "removed"
+        else
+          echo "not present"
+        fi
+      register: always_admit_result
+      changed_when: "'removed' in always_admit_result.stdout"
+      notify: restart kubelet
+
+    # -----------------------------------------------------------------------
+    # 1.2.11  AlwaysPullImages in admission plugins
+    # -----------------------------------------------------------------------
+    - name: "1.2.11 - Add AlwaysPullImages to admission plugins"
+      tags: ["1.2", "1.2.11"]
+      shell: |
+        if grep -q '\-\-enable-admission-plugins' {{ manifest_file }}; then
+          current=$(grep -oP '(?<=--enable-admission-plugins=)\S+' {{ manifest_file }})
+          if echo "$current" | grep -q "AlwaysPullImages"; then
+            echo "already present"
+          else
+            sed -i "s|--enable-admission-plugins=\(.*\)|--enable-admission-plugins=\1,AlwaysPullImages|" {{ manifest_file }}
+            echo "added"
+          fi
+        else
+          echo "flag not found"
+        fi
+      register: pull_result
+      changed_when: "'added' in pull_result.stdout"
+      notify: restart kubelet
+
+    # -----------------------------------------------------------------------
+    # 1.2.12  ServiceAccount must NOT be in --disable-admission-plugins
+    # -----------------------------------------------------------------------
+    - name: "1.2.12 - Remove ServiceAccount from --disable-admission-plugins if present"
+      tags: ["1.2", "1.2.12"]
+      lineinfile:
+        path: "{{ manifest_file }}"
+        regexp: '^\s+- --disable-admission-plugins=.*ServiceAccount.*$'
+        state: absent
+      notify: restart kubelet
+
+    # -----------------------------------------------------------------------
+    # Post: validate YAML syntax before kubelet picks up changes
+    # -----------------------------------------------------------------------
+    - name: "Post - Validate manifest YAML syntax"
+      tags: always
+      command: >
+        python3 -c "import yaml; yaml.safe_load(open('{{ manifest_file }}'))"
+      register: yaml_valid
+      changed_when: false
+      failed_when: yaml_valid.rc != 0
+
+    # -----------------------------------------------------------------------
+    # Post: force restart kubelet so it always reloads the manifest
+    # This ensures kube-bench reads the new process args even when
+    # no task triggered the handler (all tasks were already compliant)
+    # -----------------------------------------------------------------------
+    - name: "Post - Force restart kubelet to reload manifest"
+      tags: always
+      systemd:
+        name: kubelet
+        state: restarted
+
+    - name: "Post - Wait for API server pod to be Ready"
+      tags: always
+      command: >
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf wait
+        --for=condition=Ready pod
+        -n kube-system
+        -l component=kube-apiserver
+        --timeout=5s
+      register: wait_apiserver
+      retries: 18
+      delay: 5
+      until: wait_apiserver.rc == 0
+      changed_when: false
+      failed_when: false
